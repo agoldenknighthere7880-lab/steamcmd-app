@@ -74,13 +74,23 @@ function Run-Wait($exe, $argList) {
 
 function Set-Busy($busy) {
     $script:busy = $busy
-    foreach ($b in @($btnSteam, $btnGame, $btnRefresh, $btnUpdateNow, $btnStartSrv, $btnCheckNow)) { $b.Enabled = -not $busy }
+    foreach ($b in @($btnSteam, $btnGame, $btnRefresh, $btnUpdateNow, $btnStartSrv, $btnCheckNow, $btnInstallMods)) { $b.Enabled = -not $busy }
     $form.Cursor = if ($busy) { 'WaitCursor' } else { 'Default' }
 }
 
 function Safe-Name($n) { (($n -replace '[^\w\- ]', '').Trim() -replace '\s+', '-') }
 
-function Get-UpdateArgs($appId, $dir, $forFile = $false) {
+function Ensure-Server($s) {
+    # Older saved servers lack the workshop fields; add them with defaults
+    $defs = [ordered]@{ Mods = [object[]]@(); WorkshopAppId = ''; AutoMods = $true; CopyMods = $false; ModDir = '' }
+    foreach ($k in $defs.Keys) {
+        if ($null -eq $s.PSObject.Properties[$k]) {
+            $s.PSObject.Properties.Add((New-Object System.Management.Automation.PSNoteProperty($k, $defs[$k])))
+        }
+    }
+}
+
+function Get-UpdateArgs($appId, $dir, $forFile = $false, $extra = '', $noApp = $false) {
     # Launcher .bat files never contain the password: they rely on SteamCMD's cached login
     $login = '+login anonymous'
     if (-not $chkAnon.Checked) {
@@ -88,7 +98,9 @@ function Get-UpdateArgs($appId, $dir, $forFile = $false) {
         if ($txtPass.Text -and -not $forFile) { $login += " `"$($txtPass.Text)`"" }
     }
     $val = if ($chkVal.Checked) { ' validate' } else { '' }
-    return "+force_install_dir `"$dir`" $login +app_update $appId$val +quit"
+    $app = if ($noApp) { '' } else { " +app_update $appId$val" }
+    $mods = if ($extra) { " $extra" } else { '' }
+    return "+force_install_dir `"$dir`" $login$app$mods +quit"
 }
 
 # ---------------- UI helpers ----------------
@@ -133,7 +145,8 @@ $tabs.Location = New-Object System.Drawing.Point(10, 10); $tabs.Size = New-Objec
 $tabSetup = New-Object System.Windows.Forms.TabPage 'Setup'
 $tabGames = New-Object System.Windows.Forms.TabPage 'Game list'
 $tabSrv   = New-Object System.Windows.Forms.TabPage 'My servers'
-$tabs.TabPages.AddRange(@($tabSetup, $tabGames, $tabSrv))
+$tabMods  = New-Object System.Windows.Forms.TabPage 'Workshop mods'
+$tabs.TabPages.AddRange(@($tabSetup, $tabGames, $tabSrv, $tabMods))
 $form.Controls.Add($tabs)
 
 $txtLog = New-Object System.Windows.Forms.TextBox
@@ -279,6 +292,7 @@ function Get-SelectedServer {
 }
 
 function Refresh-Servers {
+    foreach ($x in $script:servers) { Ensure-Server $x }
     $script:loading = $true
     $lvSrv.BeginUpdate(); $lvSrv.Items.Clear()
     foreach ($s in $script:servers) {
@@ -289,6 +303,7 @@ function Refresh-Servers {
     }
     $lvSrv.EndUpdate()
     $script:loading = $false
+    if ($cmbSrv) { Refresh-ModServers }
 }
 
 function Update-Server($s) {
@@ -297,8 +312,11 @@ function Update-Server($s) {
     if (-not $chkAnon.Checked -and -not $txtUser.Text.Trim()) { Log 'Enter a Steam username on the Setup tab or tick anonymous.'; return $false }
     New-Item -ItemType Directory -Force -Path $s.Dir | Out-Null
     Log "Updating $($s.Name) (console window will open)..."
-    $code = Run-Wait $exe (Get-UpdateArgs $s.AppId $s.Dir)
+    $extra = if ($s.AutoMods) { Get-ModArgs $s } else { '' }
+    if ($extra) { Log 'Workshop mods are included in this run.' }
+    $code = Run-Wait $exe (Get-UpdateArgs $s.AppId $s.Dir $false $extra)
     if ($code -eq 0) { Log "$($s.Name) is up to date." } else { Log "SteamCMD exited with code $code." }
+    if ($extra) { Finish-Mods $s }
     return ($code -eq 0)
 }
 
@@ -416,6 +434,7 @@ $btnStartSrv.Add_Click({
     Set-Busy $true
     try {
         if ($s.AutoUpdate) { if (-not (Update-Server $s)) { Log 'Update failed, starting anyway.' } }
+        elseif ($s.AutoMods -and @($s.Mods).Count -gt 0) { if (-not (Install-Mods $s)) { Log 'Mod install failed, starting anyway.' } }
         if (-not $s.Cmd) { Log 'No start command set for this server.' }
         elseif (-not (Test-Path $s.Dir)) { Log 'Install folder does not exist yet.' }
         else { Start-Process cmd.exe -ArgumentList "/k $($s.Cmd)" -WorkingDirectory $s.Dir; Log "Started $($s.Name)." }
@@ -431,13 +450,228 @@ $btnLauncher.Add_Click({
     New-Item -ItemType Directory -Force -Path $folder | Out-Null
     $file = Join-Path $folder ("Start-" + (Safe-Name $s.Name) + '.bat')
     $lines = @('@echo off', "title $($s.Name)")
-    if ($s.AutoUpdate) { $lines += "`"$exe`" $(Get-UpdateArgs $s.AppId $s.Dir $true)" }
+    $extra = if ($s.AutoMods) { Get-ModArgs $s } else { '' }
+    if ($s.AutoUpdate) { $lines += "`"$exe`" $(Get-UpdateArgs $s.AppId $s.Dir $true $extra)" }
+    elseif ($extra) { $lines += "`"$exe`" $(Get-UpdateArgs $s.AppId $s.Dir $true $extra $true)" }
+    if ($extra -and $s.CopyMods -and $s.ModDir) {
+        $root = if ([IO.Path]::IsPathRooted($s.ModDir)) { $s.ModDir } else { Join-Path $s.Dir $s.ModDir }
+        foreach ($mm in @($s.Mods | Where-Object { $_.Enabled })) {
+            $src = Join-Path $s.Dir "steamapps\workshop\content\$(Get-WApp $s)\$($mm.Id)"
+            $lines += "xcopy `"$src`" `"$(Join-Path $root $mm.Id)`" /E /I /Y /Q >nul"
+        }
+    }
     $lines += "cd /d `"$($s.Dir)`""
     if ($s.Cmd) { $lines += $s.Cmd }
     $lines += 'pause'
     $lines | Set-Content -Path $file -Encoding ASCII
     Log "Launcher created: $file"
     Start-Process explorer.exe "/select,`"$file`""
+})
+
+# ---------------- Tab: Workshop mods ----------------
+Add-Label $tabMods 'Server:' 10 10 | Out-Null
+$cmbSrv = New-Object System.Windows.Forms.ComboBox
+$cmbSrv.DropDownStyle = 'DropDownList'; $cmbSrv.Location = New-Object System.Drawing.Point(10, 32); $cmbSrv.Width = 330
+$tabMods.Controls.Add($cmbSrv)
+Add-Label $tabMods 'Workshop App ID (blank = server app):' 360 10 | Out-Null
+$txtWApp = Add-Text $tabMods 360 32 200 ''
+$chkAutoMods = Add-Check $tabMods 'Install / update ticked mods automatically when this server updates or starts' 10 64 $true
+Add-Label $tabMods 'Add Workshop item(s): paste an ID or a Workshop URL (several allowed)' 10 94 | Out-Null
+$txtModId = Add-Text $tabMods 10 117 590 ''
+$btnAddMod = Add-Button $tabMods 'Add' 610 115 90 27
+$lvMods = Add-ListView $tabMods 10 152 690 165
+[void]$lvMods.Columns.Add('Install', 60); [void]$lvMods.Columns.Add('Workshop ID', 110)
+[void]$lvMods.Columns.Add('Name', 330); [void]$lvMods.Columns.Add('Status', 150)
+$btnRemoveMod = Add-Button $tabMods 'Remove selected' 10 325 150
+$btnOpenMods = Add-Button $tabMods 'Open mods folder' 170 325 150
+$chkCopy = Add-Check $tabMods 'Also copy mods into this folder after download:' 10 365 $false
+$txtModDir = Add-Text $tabMods 10 390 590 ''
+$btnModBrowse = Add-Button $tabMods 'Browse...' 610 388 90 27
+Add-Label $tabMods 'Unticked: mods stay in steamapps\workshop\content\<app>\<id>. Relative paths = inside install folder.' 10 422 | Out-Null
+$btnInstallMods = Add-Button $tabMods 'Install / update mods now' 10 448 250 34
+
+function Get-CurMod {
+    $i = $cmbSrv.SelectedIndex
+    if ($i -lt 0 -or $i -ge $script:servers.Count) { return $null }
+    return $script:servers[$i]
+}
+function Get-ModServer {
+    $s = Get-CurMod
+    if (-not $s) { Log 'Add a server on My servers first, then pick it here.' }
+    return $s
+}
+function Get-WApp($s) { if ([string]$s.WorkshopAppId -match '^\d+$') { return [string]$s.WorkshopAppId } else { return [string]$s.AppId } }
+
+function Get-ModArgs($s) {
+    $w = Get-WApp $s
+    $val = if ($chkVal.Checked) { ' validate' } else { '' }
+    return (@($s.Mods | Where-Object { $_.Enabled } | ForEach-Object { "+workshop_download_item $w $($_.Id)$val" }) -join ' ')
+}
+
+function Get-WorkshopInfo($id) {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $r = Invoke-RestMethod -Method Post -Uri 'https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/' `
+         -Body @{ itemcount = 1; 'publishedfileids[0]' = $id }
+    $d = $r.response.publishedfiledetails | Select-Object -First 1
+    if ($d -and $d.result -eq 1) { return [pscustomobject]@{ Title = [string]$d.title; AppId = [string]$d.consumer_app_id } }
+    return $null
+}
+
+function Refresh-ModList {
+    $script:loading = $true
+    $lvMods.BeginUpdate(); $lvMods.Items.Clear()
+    $s = Get-CurMod
+    if ($s) {
+        $w = Get-WApp $s
+        foreach ($m in @($s.Mods)) {
+            $it = New-Object System.Windows.Forms.ListViewItem('')
+            [void]$it.SubItems.Add([string]$m.Id); [void]$it.SubItems.Add([string]$m.Name)
+            $have = Test-Path (Join-Path $s.Dir "steamapps\workshop\content\$w\$($m.Id)")
+            [void]$it.SubItems.Add($(if ($have) { 'Downloaded' } else { 'Not downloaded' }))
+            $it.Tag = [string]$m.Id; $it.Checked = [bool]$m.Enabled
+            [void]$lvMods.Items.Add($it)
+        }
+    }
+    $lvMods.EndUpdate()
+    $script:loading = $false
+}
+
+function Load-ModServer {
+    $script:loading = $true
+    $s = Get-CurMod
+    if ($s) {
+        $txtWApp.Text = [string]$s.WorkshopAppId; $chkAutoMods.Checked = [bool]$s.AutoMods
+        $chkCopy.Checked = [bool]$s.CopyMods; $txtModDir.Text = [string]$s.ModDir
+    } else {
+        $txtWApp.Text = ''; $txtModDir.Text = ''; $chkCopy.Checked = $false
+    }
+    $script:loading = $false
+    Refresh-ModList
+}
+
+function Refresh-ModServers {
+    $keep = $cmbSrv.SelectedIndex
+    $script:loading = $true
+    $cmbSrv.Items.Clear()
+    foreach ($x in $script:servers) { [void]$cmbSrv.Items.Add([string]$x.Name) }
+    if ($cmbSrv.Items.Count -gt 0) { $cmbSrv.SelectedIndex = [Math]::Max(0, [Math]::Min($keep, $cmbSrv.Items.Count - 1)) }
+    $script:loading = $false
+    Load-ModServer
+}
+
+function Store-ModSettings {
+    if ($script:loading) { return }
+    $s = Get-CurMod
+    if (-not $s) { return }
+    $s.WorkshopAppId = $txtWApp.Text.Trim(); $s.AutoMods = $chkAutoMods.Checked
+    $s.CopyMods = $chkCopy.Checked; $s.ModDir = $txtModDir.Text.Trim()
+    Save-Config
+}
+
+function Finish-Mods($s) {
+    $w = Get-WApp $s
+    foreach ($m in @($s.Mods | Where-Object { $_.Enabled })) {
+        $src = Join-Path $s.Dir "steamapps\workshop\content\$w\$($m.Id)"
+        if (-not (Test-Path $src)) {
+            Log "Mod $($m.Id) ($($m.Name)): NOT downloaded. Many games only allow Workshop downloads from an account that owns the game (untick Anonymous on Setup)."
+            continue
+        }
+        Log "Mod $($m.Id) ($($m.Name)): downloaded."
+        if ($s.CopyMods -and $s.ModDir) {
+            $root = if ([IO.Path]::IsPathRooted($s.ModDir)) { $s.ModDir } else { Join-Path $s.Dir $s.ModDir }
+            $dst = Join-Path $root $m.Id
+            New-Item -ItemType Directory -Force -Path $dst | Out-Null
+            Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force
+            Log "  copied to $dst"
+        }
+    }
+    Refresh-ModList
+}
+
+function Install-Mods($s) {
+    $exe = Join-Path $txtCmd.Text.Trim() 'steamcmd.exe'
+    if (-not (Test-Path $exe)) { Log 'SteamCMD not installed yet. Run step 1 on the Setup tab.'; return $false }
+    if (-not $chkAnon.Checked -and -not $txtUser.Text.Trim()) { Log 'Enter a Steam username on the Setup tab or tick anonymous.'; return $false }
+    $extra = Get-ModArgs $s
+    if (-not $extra) { Log 'No mods ticked for this server.'; return $false }
+    New-Item -ItemType Directory -Force -Path $s.Dir | Out-Null
+    Log "Installing mods for $($s.Name) (console window will open)..."
+    $code = Run-Wait $exe (Get-UpdateArgs $s.AppId $s.Dir $false $extra $true)
+    Finish-Mods $s
+    return ($code -eq 0)
+}
+
+$cmbSrv.Add_SelectedIndexChanged({ if (-not $script:loading) { Load-ModServer } })
+$tabs.Add_SelectedIndexChanged({ if ($tabs.SelectedTab -eq $tabMods) { Refresh-ModServers } })
+$txtWApp.Add_TextChanged({ Store-ModSettings })
+$txtModDir.Add_TextChanged({ Store-ModSettings })
+$chkAutoMods.Add_CheckedChanged({ Store-ModSettings })
+$chkCopy.Add_CheckedChanged({ Store-ModSettings })
+$btnModBrowse.Add_Click({ Browse $txtModDir })
+
+$lvMods.Add_ItemChecked({
+    if ($script:loading) { return }
+    $item = $_.Item
+    $s = Get-CurMod
+    if (-not $s) { return }
+    $id = [string]$item.Tag
+    $m = @($s.Mods | Where-Object { $_.Id -eq $id }) | Select-Object -First 1
+    if ($m) { $m.Enabled = $item.Checked; Save-Config }
+})
+
+$btnAddMod.Add_Click({
+    $s = Get-ModServer
+    if (-not $s) { return }
+    $ids = @([regex]::Matches($txtModId.Text, '(?<=id=)\d+|\b\d{5,}\b') | ForEach-Object { $_.Value } | Select-Object -Unique)
+    if ($ids.Count -eq 0) { Log 'No Workshop ID found. Paste an ID or a Workshop URL.'; return }
+    $form.Cursor = 'WaitCursor'
+    foreach ($id in $ids) {
+        if (@($s.Mods | Where-Object { $_.Id -eq $id }).Count -gt 0) { Log "Mod $id is already in the list."; continue }
+        $name = '(name unknown)'
+        try {
+            $info = Get-WorkshopInfo $id
+            if ($info) {
+                if ($info.Title) { $name = $info.Title }
+                if (-not $s.WorkshopAppId -and $info.AppId -and $info.AppId -ne '0') {
+                    $s.WorkshopAppId = $info.AppId; $txtWApp.Text = $info.AppId
+                    Log "Workshop App ID set to $($info.AppId) (from Steam)."
+                } elseif ($info.AppId -and $info.AppId -ne (Get-WApp $s)) {
+                    Log "Warning: mod $id belongs to app $($info.AppId), not $(Get-WApp $s)."
+                }
+            } else { Log "Steam has no public Workshop item $id (check the ID)." }
+        } catch { Log "Couldn't look up mod $id (added anyway)." }
+        $s.Mods = @($s.Mods) + [pscustomobject]@{ Id = [string]$id; Name = $name; Enabled = $true }
+        Log "Added mod $id - $name"
+    }
+    $txtModId.Text = ''
+    $form.Cursor = 'Default'
+    Save-Config; Refresh-ModList
+})
+
+$btnRemoveMod.Add_Click({
+    $s = Get-ModServer
+    if (-not $s) { return }
+    $gone = @($lvMods.SelectedItems | ForEach-Object { [string]$_.Tag })
+    if ($gone.Count -eq 0) { Log 'Select mod(s) in the list first.'; return }
+    $s.Mods = @($s.Mods | Where-Object { $gone -notcontains $_.Id })
+    Save-Config; Refresh-ModList
+    Log "Removed $($gone.Count) mod(s) from the list (files on disk untouched)."
+})
+
+$btnOpenMods.Add_Click({
+    $s = Get-ModServer
+    if (-not $s) { return }
+    $folder = Join-Path $s.Dir "steamapps\workshop\content\$(Get-WApp $s)"
+    if (Test-Path $folder) { Start-Process explorer.exe $folder } else { Log "Nothing downloaded yet: $folder" }
+})
+
+$btnInstallMods.Add_Click({
+    $s = Get-ModServer
+    if (-not $s) { return }
+    Store-ModSettings; Save-Config
+    Set-Busy $true
+    try { [void](Install-Mods $s) } catch { Log "ERROR: $($_.Exception.Message)" }
+    Set-Busy $false
 })
 
 # ---------------- Setup tab handlers ----------------
