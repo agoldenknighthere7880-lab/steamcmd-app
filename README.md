@@ -23,3 +23,4 @@ If Windows blocks the script: right-click the `.ps1` > Properties > Unblock.
 - Settings are stored in `%APPDATA%\steamcmd-gui.json`, outside this repo.
 - A remembered password is encrypted with Windows DPAPI (current user, this PC only).
 - Not affiliated with Valve. SteamCMD is downloaded from Valve's servers.
+<img width="753" height="710" alt="Screenshot 2026-10-28 203935" src="https://github.com/user-attachments/assets/99655c76-eae2-4ab3-89a2-26b5661ce56c" />
